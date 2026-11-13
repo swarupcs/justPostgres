@@ -40,8 +40,13 @@ const schema = z.object({
   /**
    * Hostname users connect their clients to. Not the same as JP_HOST, which is
    * only the interface the control plane's HTTP server binds.
+   *
+   * Optional: left unset, connection strings use whatever host the admin
+   * opened the UI on — the IP if they browsed to the IP, the domain if they
+   * browsed to the domain. Set it to pin one, e.g. when the UI sits behind a
+   * different name than the databases.
    */
-  JP_PUBLIC_HOST: z.string().default("localhost"),
+  JP_PUBLIC_HOST: z.string().optional(),
 
   /** Host ports available to publish project containers on (routing mode 3). */
   /**
@@ -80,6 +85,12 @@ const schema = z.object({
   JP_BACKUP_RETENTION_FULL: z.coerce.number().int().min(1).max(9999).default(4),
   /** How long a backup or restore may run before the job gives up. */
   JP_BACKUP_TIMEOUT_MS: z.coerce.number().int().min(60_000).default(6 * 3600_000),
+  /**
+   * Postgres `archive_timeout`: the most seconds of committed work a host loss
+   * can take with it. Below 5 the archive fills with forced, near-empty
+   * segments faster than it buys anything.
+   */
+  JP_BACKUP_ARCHIVE_TIMEOUT_SECONDS: z.coerce.number().int().min(5).max(3600).default(60),
   /** How often to prove a backup still restores. 0 disables it. */
   JP_RESTORE_CHECK_INTERVAL_HOURS: z.coerce.number().int().min(0).default(168),
 
@@ -141,7 +152,7 @@ const schema = z.object({
   JP_BRANCH_TTL_HOURS: z.coerce.number().int().min(0).default(168),
 
   // --- REST API (M7) -------------------------------------------------------
-  JP_REST_IMAGE: z.string().default("postgrest/postgrest:latest"),
+  JP_REST_IMAGE: z.string().default("postgrest/postgrest:v16.2"),
   /**
    * Wildcard domain for the hostname form, `<ref>.api.example.com`. Without it
    * the path form `/rest/<ref>/` is the only address, which always works.
@@ -212,8 +223,9 @@ export interface Config {
   masterKey: Buffer;
   masterKeyIsEphemeral: boolean;
   docker: { host?: string; socketPath: string };
-  publicHost: string;
-  router: { enabled: boolean; host: string; sessionPort: number; poolPort: number };
+  /** Null means "the host the UI was reached on" — see resolveConnectHost. */
+  publicHost: string | null;
+  router: { enabled: boolean; host: string | null; sessionPort: number; poolPort: number };
   portRange: { start: number; end: number };
   projects: {
     imageTemplate: string;
@@ -237,6 +249,7 @@ export interface Config {
     fullEveryDays: number;
     retentionFull: number;
     timeoutMs: number;
+    archiveTimeoutSeconds: number;
     restoreCheckIntervalHours: number;
     s3: {
       bucket?: string;
@@ -354,10 +367,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     masterKey: key,
     masterKeyIsEphemeral: ephemeral,
     docker: { host: c.JP_DOCKER_HOST, socketPath: resolveDockerSocket(env, c.JP_DOCKER_SOCKET) },
-    publicHost: c.JP_PUBLIC_HOST,
+    publicHost: pinnedHost(c.JP_PUBLIC_HOST),
     router: {
       enabled: c.JP_ROUTER_ENABLED ?? false,
-      host: c.JP_ROUTER_PUBLIC_HOST ?? c.JP_PUBLIC_HOST,
+      host: pinnedHost(c.JP_ROUTER_PUBLIC_HOST) ?? pinnedHost(c.JP_PUBLIC_HOST),
       sessionPort: c.JP_ROUTER_SESSION_PORT,
       poolPort: c.JP_ROUTER_POOL_PORT,
     },
@@ -389,6 +402,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       fullEveryDays: c.JP_BACKUP_FULL_EVERY_DAYS,
       retentionFull: c.JP_BACKUP_RETENTION_FULL,
       timeoutMs: c.JP_BACKUP_TIMEOUT_MS,
+      archiveTimeoutSeconds: c.JP_BACKUP_ARCHIVE_TIMEOUT_SECONDS,
       restoreCheckIntervalHours: c.JP_RESTORE_CHECK_INTERVAL_HOURS,
       s3: {
         ...(c.JP_BACKUP_S3_BUCKET ? { bucket: c.JP_BACKUP_S3_BUCKET } : {}),
@@ -428,4 +442,18 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     },
     ui: { serve: c.JP_SERVE_UI ?? isProduction, dir: resolve(c.JP_UI_DIR) },
   };
+}
+
+/**
+ * A configured connection host, or null to follow the request.
+ *
+ * `localhost` counts as unset. It was the shipped default — every compose file
+ * written before the host was derived from the request still passes it — and
+ * a connection string saying localhost is only right for someone sitting at
+ * the server, who reaches the UI on localhost anyway and so gets it either way.
+ */
+export function pinnedHost(value: string | undefined): string | null {
+  const v = value?.trim();
+  if (!v || v === "localhost") return null;
+  return v;
 }
